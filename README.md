@@ -1,7 +1,9 @@
 # mcp-dutch-postal-codes
 
-[MCP](https://modelcontextprotocol.io/) server for retrieving Dutch address information by postcal code or WGS84
+[MCP](https://modelcontextprotocol.io/) server for retrieving Dutch address information by postal code or WGS84
 coordinates.
+
+This server is built using the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
 
 ## Requirements
 

@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -31,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dstotijn/go-mcp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // baseURL is the base URL for Bert Hubert's testing instance of his
@@ -72,17 +71,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	transports := []string{}
-	opts := []mcp.ServerOption{}
-
-	if useStdio {
-		transports = append(transports, "stdio")
-		opts = append(opts, mcp.WithStdioTransport())
+	// Create server with proper options
+	serverOpts := &mcp.ServerOptions{
+		Instructions: "This server provides Dutch postal code lookup tools using Bert Hubert's postal code API.",
 	}
 
-	var sseURL url.URL
+	mcpServer := mcp.NewServer("mcp-dutch-postal-codes", "1.0.0", serverOpts)
+
+	// Add tools to the server
+	registerPostalCodeTools(mcpServer)
+
+	var wg sync.WaitGroup
+
+	if useStdio {
+		log.Printf("Starting MCP server with stdio transport...")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			transport := mcp.NewStdioTransport()
+			if err := mcpServer.Run(ctx, transport); err != nil {
+				log.Printf("stdio server error: %v", err)
+			}
+		}()
+	}
+
 	if useSSE {
-		transports = append(transports, "sse")
+		log.Printf("Starting MCP server with SSE transport on %s...", httpAddr)
 
 		host := "localhost"
 		hostPart, port, err := net.SplitHostPort(httpAddr)
@@ -94,62 +108,41 @@ func main() {
 			host = hostPart
 		}
 
-		sseURL = url.URL{
+		sseURL := url.URL{
 			Scheme: "http",
 			Host:   net.JoinHostPort(host, port),
 		}
 
-		opts = append(opts, mcp.WithSSETransport(sseURL))
-	}
+		handler := mcp.NewSSEHandler(func(request *http.Request) *mcp.Server {
+			return mcpServer
+		})
 
-	mcpServer := mcp.NewServer(mcp.ServerConfig{}, opts...)
-	registerPostalCodeTools(mcpServer)
+		httpServer := &http.Server{
+			Addr:    httpAddr,
+			Handler: handler,
+			BaseContext: func(l net.Listener) context.Context {
+				return ctx
+			},
+		}
 
-	mcpServer.Start(ctx)
-
-	httpServer := &http.Server{
-		Addr:    httpAddr,
-		Handler: mcpServer,
-		BaseContext: func(l net.Listener) context.Context {
-			return ctx
-		},
-	}
-
-	if useSSE {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("HTTP server error: %v", err)
+				log.Printf("HTTP server error: %v", err)
 			}
 		}()
-	}
 
-	log.Printf("MCP server started, using transports: %v", transports)
-	if useSSE {
 		log.Printf("SSE transport endpoint: %v", sseURL.String())
 	}
 
-	// Wait for interrupt signal.
+	// Wait for interrupt signal
 	<-ctx.Done()
 	// Restore signal, allowing "force quit".
 	stop()
 
 	timeout := 5 * time.Second
-	cancelContext, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
 	log.Printf("Shutting down server (waiting %s)... Press Ctrl+C to force quit.", timeout)
-
-	var wg sync.WaitGroup
-
-	if useSSE {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := httpServer.Shutdown(cancelContext); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-				log.Printf("HTTP server shutdown error: %v", err)
-			}
-		}()
-	}
 
 	wg.Wait()
 }
@@ -169,87 +162,87 @@ func registerPostalCodeTools(mcpServer *mcp.Server) {
 		Longitude float64 `json:"longitude"`
 	}
 
-	mcpServer.RegisterTools(mcp.CreateTool(mcp.ToolDef[lookupByPostalCodeArgs]{
-		Name:        "lookup_by_postal_code",
-		Description: "Look up Dutch addresses by postal code and optional house number and letter.",
-		HandleFunc: func(ctx context.Context, args lookupByPostalCodeArgs) *mcp.CallToolResult {
+	// Create postal code lookup tool
+	postalCodeTool := mcp.NewServerTool("lookup_by_postal_code",
+		"Look up Dutch addresses by postal code and optional house number and letter.",
+		func(ctx context.Context, ss *mcp.ServerSession, params *mcp.CallToolParamsFor[lookupByPostalCodeArgs]) (*mcp.CallToolResultFor[any], error) {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			addresses, err := lookupByPostalCode(cctx, args.PostalCode, args.HouseNumber, args.HouseLetter)
+			addresses, err := lookupByPostalCode(cctx, params.Arguments.PostalCode, params.Arguments.HouseNumber, params.Arguments.HouseLetter)
 			if err != nil {
-				return &mcp.CallToolResult{
+				return &mcp.CallToolResultFor[any]{
 					Content: []mcp.Content{
-						mcp.TextContent{
+						&mcp.TextContent{
 							Text: fmt.Sprintf("Error looking up postal code: %v", err),
 						},
 					},
 					IsError: true,
-				}
+				}, nil
 			}
 
 			if len(addresses) == 0 {
-				return &mcp.CallToolResult{
+				return &mcp.CallToolResultFor[any]{
 					Content: []mcp.Content{
-						mcp.TextContent{
+						&mcp.TextContent{
 							Text: "No addresses found for the given postal code.",
 						},
 					},
-				}
+				}, nil
 			}
 
 			var contents []mcp.Content
-
 			for _, addr := range addresses {
-				contents = append(contents, mcp.TextContent{
+				contents = append(contents, &mcp.TextContent{
 					Text: formatAddress(addr),
 				})
 			}
 
-			return &mcp.CallToolResult{
+			return &mcp.CallToolResultFor[any]{
 				Content: contents,
-			}
-		},
-	}))
+			}, nil
+		})
 
-	mcpServer.RegisterTools(mcp.CreateTool(mcp.ToolDef[lookupByCoordinatesArgs]{
-		Name:        "lookup_by_coordinates",
-		Description: "Look up the nearest Dutch address by WGS84 (GPS) coordinates.",
-		HandleFunc: func(ctx context.Context, args lookupByCoordinatesArgs) *mcp.CallToolResult {
+	// Create coordinates lookup tool
+	coordinatesTool := mcp.NewServerTool("lookup_by_coordinates",
+		"Look up the nearest Dutch address by WGS84 (GPS) coordinates.",
+		func(ctx context.Context, ss *mcp.ServerSession, params *mcp.CallToolParamsFor[lookupByCoordinatesArgs]) (*mcp.CallToolResultFor[any], error) {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 
-			address, err := lookupByCoordinates(cctx, args.Latitude, args.Longitude)
+			address, err := lookupByCoordinates(cctx, params.Arguments.Latitude, params.Arguments.Longitude)
 			if err != nil {
-				return &mcp.CallToolResult{
+				return &mcp.CallToolResultFor[any]{
 					Content: []mcp.Content{
-						mcp.TextContent{
+						&mcp.TextContent{
 							Text: fmt.Sprintf("Error looking up coordinates: %v", err),
 						},
 					},
 					IsError: true,
-				}
+				}, nil
 			}
 
 			if address == nil {
-				return &mcp.CallToolResult{
+				return &mcp.CallToolResultFor[any]{
 					Content: []mcp.Content{
-						mcp.TextContent{
+						&mcp.TextContent{
 							Text: "No address found for the given coordinates.",
 						},
 					},
-				}
+				}, nil
 			}
 
-			return &mcp.CallToolResult{
+			return &mcp.CallToolResultFor[any]{
 				Content: []mcp.Content{
-					mcp.TextContent{
+					&mcp.TextContent{
 						Text: formatAddress(*address),
 					},
 				},
-			}
-		},
-	}))
+			}, nil
+		})
+
+	// Add tools to server
+	mcpServer.AddTools(postalCodeTool, coordinatesTool)
 }
 
 // lookupByPostalCode looks up addresses by postal code and optional house number and letter.
